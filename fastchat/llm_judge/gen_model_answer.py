@@ -32,6 +32,9 @@ def run_eval(
     max_gpu_memory,
     dtype,
     revision,
+    epoch,
+    model_name,
+    model_config,
 ):
     questions = load_questions(question_file, question_begin, question_end)
     # random shuffle the questions to balance the loading
@@ -63,6 +66,9 @@ def run_eval(
                 max_gpu_memory,
                 dtype=dtype,
                 revision=revision,
+                epoch=epoch,
+                model_name=model_name,
+                model_config=model_config,
             )
         )
 
@@ -82,6 +88,9 @@ def get_model_answers(
     max_gpu_memory,
     dtype,
     revision,
+    epoch=None, 
+    model_name=None,
+    model_config=None,
 ):
     model, tokenizer = load_model(
         model_path,
@@ -93,6 +102,9 @@ def get_model_answers(
         load_8bit=False,
         cpu_offloading=False,
         debug=False,
+        epoch=epoch,
+        model_name=model_name,
+        model_config=model_config,
     )
 
     for question in tqdm(questions):
@@ -269,7 +281,24 @@ if __name__ == "__main__":
         default="main",
         help="The model revision to load.",
     )
-
+    parser.add_argument(
+        "--epoch",
+        type=int,
+        default=None,
+        help="Epoch to load for OpenLM.",
+    )
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default=None,
+        help="The model name. Will be none for all model except for OpenLM.",
+    )
+    parser.add_argument(
+        "--model-config",
+        type=str,
+        default=None,
+        help="The model config. Will be none for all model except for OpenLM.",
+    )
     args = parser.parse_args()
 
     if args.num_gpus_total // args.num_gpus_per_model > 1:
@@ -299,6 +328,9 @@ if __name__ == "__main__":
         max_gpu_memory=args.max_gpu_memory,
         dtype=str_to_torch_dtype(args.dtype),
         revision=args.revision,
+        epoch=args.epoch,
+        model_name=args.model_name,
+        model_config=args.model_config,
     )
 
     reorg_answer_file(answer_file)

@@ -1,11 +1,18 @@
 """Model adapter registration."""
 
+import argparse
+import subprocess
+import boto3
 import math
 import os
 import re
 import sys
+import tempfile
 from typing import Dict, List, Optional
 import warnings
+
+import yaml
+
 
 if sys.version_info >= (3, 9):
     from functools import cache
@@ -144,8 +151,12 @@ def register_model_adapter(cls):
 
 
 @cache
-def get_model_adapter(model_path: str) -> BaseModelAdapter:
+def get_model_adapter(model_path: str, model_name: str = None) -> BaseModelAdapter:
     """Get a model adapter for a model_path."""
+
+    if model_name is not None and model_name.startswith("open_lm"):
+        return OpenLMAdapter()
+
     model_path_basename = os.path.basename(os.path.normpath(model_path))
 
     # Try the basename of model_path at first
@@ -187,6 +198,7 @@ def raise_warning_for_incompatible_cpu_offloading_configuration(
     return cpu_offloading
 
 
+
 def load_model(
     model_path: str,
     device: str = "cuda",
@@ -201,12 +213,15 @@ def load_model(
     xft_config: Optional[XftConfig] = None,
     revision: str = "main",
     debug: bool = False,
+    epoch: Optional[int] = None,
+    model_name: Optional[str] = None,
+    model_config: Optional[str] = None,
 ):
     """Load a model from Hugging Face."""
     import accelerate
 
     # get model adapter
-    adapter = get_model_adapter(model_path)
+    adapter = get_model_adapter(model_path, model_name)
 
     # Handle device mapping
     cpu_offloading = raise_warning_for_incompatible_cpu_offloading_configuration(
@@ -340,6 +355,13 @@ def load_model(
         model, tokenizer = load_xft_model(model_path, xft_config)
         return model, tokenizer
     kwargs["revision"] = revision
+
+    if model_name is not None:
+        kwargs["model_name"] = model_name
+    if model_config is not None:
+        kwargs["model_config"] = model_config
+    if epoch is not None:
+        kwargs["epoch"] = epoch
 
     if dtype is not None:  # Overwrite dtype if it is provided in the arguments.
         kwargs["torch_dtype"] = dtype
@@ -2419,6 +2441,157 @@ class RekaAdapter(BaseModelAdapter):
         return get_conv_template("api_based_default")
 
 
+class OpenLMAdapter(BaseModelAdapter):
+    """The model adapter for OpenLM"""
+
+    def match(self, model_path: str):
+        return "openlm" in model_path.lower() or \
+            "open_lm" in model_path.lower()
+
+    def get_default_conv_template(self, model_path: str) -> Conversation:
+        return get_conv_template("openlm")
+    
+    def load_model(self, model_path: str, from_pretrained_kwargs: Dict):
+        import pdb; pdb.set_trace()
+        epoch = -1
+        if "epoch" in from_pretrained_kwargs:
+            epoch = int(from_pretrained_kwargs["epoch"])
+        
+        model_name = None
+        if "model_name" in from_pretrained_kwargs:
+            model_name = from_pretrained_kwargs["model_name"]
+
+        checkpoint = self._get_checkpoint_path(model_path, epoch)
+
+        try:
+            from open_lm.utils.transformers.hf_model import OpenLMforCausalLM  # noqa: F811
+            from open_lm.main import load_model # noqa: F811
+            from open_lm.model import create_params  # noqa: F811
+            from open_lm.utils.transformers.hf_config import OpenLMConfig  # noqa: F811
+
+        except ModuleNotFoundError:
+            raise Exception(
+                "attempted to use 'open_lm' LM type, but package `open_lm` is not installed." \
+                "please install open_lm from `https://github.com/TRI-ML/open_lm`",
+            )
+        param_path = self._get_param_path_if_exists(model_path)
+
+        # if param_path is None:
+        #     raise ValueError("We need params.txt to be in the same folder as the model for MT-Bench evaluation.")
+
+        config = self._create_config_dict(model_name, param_path)
+        model = OpenLMforCausalLM(OpenLMConfig(create_params(config)))
+
+        config.resume = checkpoint
+        config.distributed = False
+        load_model(config, model.model)
+        model.model.eval()
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            "EleutherAI/gpt-neox-20b",
+        )
+
+        return model, tokenizer
+
+    def _get_param_path_if_exists(self, model_path: str) -> Optional[str]:
+        if not model_path.startswith("s3://"):
+            param_path = os.path.join(model_path, "params.txt")
+            if not os.path.exists(param_path):
+                return None
+            return param_path
+        
+        s3 = boto3.client('s3')
+
+        # Split the S3 path by '/'
+        path_components = model_path[len("s3://"):].split('/')
+        
+        # The bucket name is the first component
+        bucket_name = path_components[0]
+        s3_param_path_path = os.path.join('/'.join(path_components[1:]), 'params.txt')
+        
+        param_file_exists = False
+        try:
+            param_file_exists = bool(s3.head_object(Bucket=bucket_name, Key=s3_param_path_path))
+        except Exception:
+            pass
+        
+        if param_file_exists:
+            tmpfile_name = "/tmp/params.txt"
+            tmp_file = open(tmpfile_name, "wb")
+            s3.download_fileobj(bucket_name, s3_param_path_path, tmp_file)
+            print("Downloaded params.txt from S3 to a temporary file")
+            return tmpfile_name
+        return None
+
+    def _create_config_dict(self, model_name: str = None, config_file: str = None, **kwargs) -> None:
+        try:
+            from open_lm.params import add_model_args, add_training_args  # noqa: F811
+        except ModuleNotFoundError:
+            raise Exception(
+                "attempted to use 'open_lm' LM type, but package `open_lm` is not installed." \
+                "please install open_lm from `https://github.com/TRI-ML/open_lm`",
+            )
+        parser = argparse.ArgumentParser()
+        add_training_args(parser)
+        add_model_args(parser)
+
+        config = parser.parse_args([])
+
+        if model_name is not None:
+            config.model = model_name
+        
+        if config_file is None:
+            return config
+
+        with open(config_file, "r") as f:
+            config_dict = yaml.safe_load(f)
+        for k, v in config_dict.items():
+            if v == "None":
+                v = None
+
+            # we changed args
+            if k == "batch_size":
+                k = "per_gpu_batch_size"
+            if k == "val_batch_size":
+                k = "per_gpu_val_batch_size"
+            setattr(config, k, v)
+
+        try:
+            from open_lm.model import create_params  # noqa: F811
+            from open_lm.utils.transformers.hf_config import OpenLMConfig  # noqa: F811
+        except ModuleNotFoundError:
+            raise Exception(
+                "attempted to use 'open_lm' LM type, but package `open_lm` is not installed." \
+                "please install open_lm from `https://github.com/TRI-ML/open_lm`",
+            )
+
+        return OpenLMConfig(create_params(config))
+
+    def _get_checkpoint_path(self, model_path, epoch, profile=None):
+        if epoch == -1:
+            # Get list of files in s3_path starting with epoch_
+            cmd = "ls {model_path}checkpoints/"
+            if model_path.startswith("s3://"):
+                if not model_path.endswith("/"):
+                    model_path += "/"
+
+                cmd = f"aws s3 ls {model_path}checkpoints/"
+
+            files = subprocess.run(
+                f"{cmd} | awk '{{print $4}}' | grep epoch_",
+                shell=True,
+                capture_output=True,
+            )
+            files = files.stdout.decode("utf-8").split("\n")
+            files = [f for f in files if f != ""]
+
+            files = [f.split("epoch_")[1].split(".pt")[0] for f in files]
+            files = [int(f) for f in files]
+            epoch = max(files)
+        return f"{model_path}checkpoints/epoch_{epoch}.pt"
+
+
+
 # Note: the registration order matters.
 # The one registered earlier has a higher matching priority.
 register_model_adapter(PeftModelAdapter)
@@ -2519,6 +2692,7 @@ register_model_adapter(YandexGPTAdapter)
 register_model_adapter(CllmAdapter)
 register_model_adapter(RekaAdapter)
 register_model_adapter(SmaugChatAdapter)
+register_model_adapter(OpenLMAdapter)
 
 # After all adapters, try the default base adapter.
 register_model_adapter(BaseModelAdapter)
